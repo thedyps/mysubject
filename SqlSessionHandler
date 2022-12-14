@@ -1,0 +1,237 @@
+/*
+ * (c)BOC
+ */
+package com.bizon.sbms.server.dti.common.service;
+
+import com.bizon.sbms.server.dti.adapter.service.DynamicDSContextHolder;
+
+import java.io.*;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.*;
+import java.util.regex.Pattern;
+import javax.annotation.PostConstruct;
+
+import com.bizon.sbms.server.dti.common.util.SeedCryptoUtil;
+import org.apache.commons.beanutils.BeanUtils;
+import org.apache.commons.dbcp2.BasicDataSource;
+import org.apache.xbean.spring.context.ClassPathXmlApplicationContext;
+import org.apache.xbean.spring.context.FileSystemXmlApplicationContext;
+import org.mybatis.spring.SqlSessionFactoryBean;
+import org.mybatis.spring.SqlSessionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.MutablePropertyValues;
+import org.springframework.beans.PropertyValue;
+import org.springframework.beans.PropertyValues;
+import org.springframework.beans.factory.BeanFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.beans.factory.support.BeanDefinitionRegistry;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.beans.factory.support.DefaultSingletonBeanRegistry;
+import org.springframework.beans.factory.support.GenericBeanDefinition;
+import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
+import org.springframework.beans.factory.xml.XmlBeanFactory;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionDefinition;
+import org.xml.sax.InputSource;
+
+/**
+ *
+ * @author jh,Seo
+ */
+@Service
+public class SqlSessionHandler {
+
+    private final Logger logger = LoggerFactory.getLogger(this.getClass());
+
+    @Autowired
+    private List<SqlSessionTemplate> sessionBeans;
+
+    private final Map<String, SqlSessionTemplate> sessionBeanMap = new HashMap<>();
+
+    @Autowired
+    private ApplicationContext applicationContext;
+
+    @Value("${sbms.key:sbms_default_key}")
+    private String propKey;
+
+    @Value("${sbms.system.cryptoinfo.use:}")
+    private String useCryptoInfo;
+
+    @Autowired
+    DefaultListableBeanFactory beanFactory;
+
+    //@Autowired
+    @PostConstruct
+    void initialize() {
+
+        logger.info(" >>> create sessionBeanMap >>>");
+        for (SqlSessionTemplate bean : sessionBeans) {
+
+            String environmentId = bean.getConfiguration().getEnvironment().getId();
+
+            logger.info("Datasource env id = {}", environmentId);
+
+            if (!"SqlSessionFactoryBean".equals(environmentId)) {
+
+                Connection conn = null;
+                Statement stmt = null;
+                ResultSet rs = null;
+
+                String driverClassName = null;
+                String jdbcUrl = null;
+
+                try {
+
+                    BasicDataSource dataSource = (BasicDataSource) applicationContext.getBean("dataSourceDTI-" + environmentId);
+                    driverClassName = dataSource.getDriverClassName();
+                    jdbcUrl = dataSource.getUrl();
+
+                    // 암호화 정보 사용여부 (사용인경우 설정파일의 정보는 signgate toolkit을 통한 암호화 된 텍스트로 설정해야한다)
+                    // (컨테이너의 Bean정보를 재설정, 사용상 주의가 필요하다.)
+                    if (null != useCryptoInfo && !"".equals(useCryptoInfo) && useCryptoInfo.toLowerCase().equals("true")) {
+                        logger.info("암호화 정보 사용");
+                        SeedCryptoUtil seedCryptoUtil = new SeedCryptoUtil();
+                        dataSource.setPassword(seedCryptoUtil.decryptSeed(dataSource.getPassword(), propKey));
+                    }
+
+                    if(driverClassName.lastIndexOf("mysql") != -1) {
+
+                        // MySQL은 속도향상을 위해 jdbc url에 서버 옵션을 추가한다.
+                        final StringBuffer _additionalDbServerParam = new StringBuffer();
+                        _additionalDbServerParam.append("useCursorFetch=true");
+                        _additionalDbServerParam.append("&defaultFetchSize=100");
+                        _additionalDbServerParam.append("&useLocalSessionState=true");
+                        _additionalDbServerParam.append("&cachePrepStmts=true");
+                        _additionalDbServerParam.append("&cacheServerConfiguration=true");
+                        _additionalDbServerParam.append("&cacheResultSetMetadata=true");
+                        _additionalDbServerParam.append("&maintainTimeStats=false");
+                        _additionalDbServerParam.append("&elideSetAutoCommits=true");
+
+                        dataSource.setValidationQuery("select 1");
+                        dataSource.setDefaultTransactionIsolation(TransactionDefinition.ISOLATION_READ_UNCOMMITTED);
+
+                        if (jdbcUrl.lastIndexOf("?") > -1) {
+                            dataSource.setUrl(jdbcUrl + "&" + _additionalDbServerParam.toString());
+                        } else {
+                            dataSource.setUrl(jdbcUrl + "?" + _additionalDbServerParam.toString());
+                        }
+                    }
+
+                    conn = bean.getSqlSessionFactory().openSession().getConnection();
+                    stmt = conn.createStatement();
+                    // rs = stmt.executeQuery("SELECT COUNT(*) as cnt FROM XXSB_DTI_INTERFACE WHERE conversation_id = '*'");
+                    rs = stmt.executeQuery("SELECT COUNT(*) as cnt FROM XXSB_DTI_APPROVE_ID");
+
+                    while (rs.next()) {
+                        logger.trace("## {} ##", rs.getInt(1));
+                    }
+
+                    rs.close();
+                    stmt.close();
+                    conn.close();
+
+                } catch (Exception e) {
+                    logger.error("JDBC session error : {}", e);
+                } finally {
+                    try {
+                        if (rs != null) {
+                            rs.close();
+                        }
+                        if (stmt != null) {
+                            stmt.close();
+                        }
+                        if (conn != null) {
+                            conn.close();
+                        }
+                    } catch (Exception e) {
+
+                        logger.error("ignore : {}", e);
+
+                    }
+                }
+
+                logger.info("초기화를 종료합니다.");
+                sessionBeanMap.put(environmentId, bean);
+            }
+        }
+        logger.info(" <<< create sessionBeanMap <<<");
+        logger.info(" SqlSessionTemplates have been set.");
+    }
+
+    public void reInitialize() throws IOException, SQLException {
+        logger.info(" >>> recreate sessionBeanMap >>>");
+
+        ConfigurableApplicationContext configContext = (ConfigurableApplicationContext) applicationContext;
+        BeanDefinitionRegistry registry = (BeanDefinitionRegistry) configContext.getBeanFactory();
+
+        BasicDataSource dataSource = (BasicDataSource) configContext.getBean("dataSourceDTI-default");
+        dataSource.close();
+
+        registry.removeBeanDefinition("dataSourceDTI-default");
+        registry.removeBeanDefinition("transactionManagerDTI");
+        registry.removeBeanDefinition("sqlSessionFactoryDTI-default");
+        registry.removeBeanDefinition("sqlSessionDTI");
+
+        Path xmlPath = Paths.get(System.getProperty("SBMS_HOME"),"conf","adapter", "dti.datasource.default.xml");
+        Resource xmlResource = new FileSystemResource(xmlPath.toFile());
+        GenericApplicationContext createdContext = new GenericApplicationContext(applicationContext);
+        XmlBeanDefinitionReader reader = new XmlBeanDefinitionReader(createdContext);
+        reader.loadBeanDefinitions(xmlResource);
+
+        BeanDefinition beanDefinition = createdContext.getBeanDefinition("sqlSessionFactoryDTI-default");
+        MutablePropertyValues propertyValues = beanDefinition.getPropertyValues();
+        propertyValues.removePropertyValue("configLocation");
+        PropertyValue value = new PropertyValue("configLocation", "classpath:../mybatis-config.xml");
+        propertyValues.addPropertyValue(value);
+
+        createdContext.refresh();
+        beanFactory.registerSingleton("dataSourceDTI-default",
+                createdContext.getBean("dataSourceDTI-default"));
+        beanFactory.registerSingleton("transactionManagerDTI",
+                createdContext.getBean("transactionManagerDTI"));
+        beanFactory.registerSingleton("sqlSessionFactoryDTI-default",
+                createdContext.getBean("sqlSessionFactoryDTI-default"));
+        beanFactory.registerSingleton("sqlSessionDTI",
+                createdContext.getBean("sqlSessionDTI"));
+
+        for (SqlSessionTemplate bean : sessionBeans) {
+            String environmentId = bean.getConfiguration().getEnvironment().getId();
+
+            logger.info("Datasource env id = {}", environmentId);
+
+            if (!"SqlSessionFactoryBean".equals(environmentId)) {
+                sessionBeans.remove(bean);
+                sessionBeans.add((SqlSessionTemplate) createdContext.getBean("sqlSessionDTI"));
+            }
+        }
+        sessionBeanMap.clear();
+        initialize();
+    }
+
+    public SqlSessionTemplate getSqlSessionTemplate() {
+
+        return sessionBeanMap.get(DynamicDSContextHolder.getDynamicDSType());
+
+    }
+
+    public Iterator<String> iterator() {
+        return (Iterator<String>) sessionBeanMap.keySet().iterator();
+    }
+
+}
